@@ -30,7 +30,7 @@ class GameController(
         val gameFinished: Boolean = false,
         val showSaveDialog: Boolean = false,
         val showNicknameForSave: Boolean = false,
-        val showExitGameDialog: Boolean = false,    // 新增
+        val showExitGameDialog: Boolean = false,
         val totalTimeSeconds: Int = 0,
         val title: String = "",
         val challengeIndex: Int = 0,
@@ -44,6 +44,11 @@ class GameController(
     private var startTime = System.currentTimeMillis()
     private var timerJob: kotlinx.coroutines.Job? = null
     private var returnCallback: (() -> Unit)? = null
+
+    // 暂停相关
+    private var isPaused = false
+    private var pausedDuration = 0L          // 累计暂停毫秒数
+    private var pauseTimestamp = 0L           // 当前暂停开始时间
 
     fun setReturnCallback(callback: (() -> Unit)?) {
         returnCallback = callback
@@ -80,10 +85,11 @@ class GameController(
                 delay(1000)
                 val state = _uiState.value
                 if (state.gameFinished || state.levelCleared) break
+                if (isPaused) continue       // 暂停时跳过倒计时
                 if (state.timeLeft > 0) {
                     _uiState.value = state.copy(
-                        timeLeft = state.timeLeft - 1,
-                        totalTimeSeconds = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+                        timeLeft = state.timeLeft - 1
+                        // 总时间不再实时更新，保存时再计算真实耗时
                     )
                 }
                 if (_uiState.value.timeLeft == 0 && !state.levelCleared && !state.gameFinished) {
@@ -93,9 +99,24 @@ class GameController(
         }
     }
 
+    fun pauseGame() {
+        if (!isPaused) {
+            isPaused = true
+            pauseTimestamp = System.currentTimeMillis()
+        }
+    }
+
+    fun resumeGame() {
+        if (isPaused && pauseTimestamp > 0) {
+            pausedDuration += (System.currentTimeMillis() - pauseTimestamp)
+            pauseTimestamp = 0
+        }
+        isPaused = false
+    }
+
     fun onTileClick(r: Int, c: Int) {
         val state = _uiState.value
-        if (state.levelCleared || state.gameFinished) return
+        if (state.levelCleared || state.gameFinished || isPaused) return
 
         if (state.selectedFirst == null) {
             AudioManager.playClick()
@@ -187,57 +208,74 @@ class GameController(
         }
     }
 
-    fun exitGame() {
-        finishGame()
-    }
-
-    private fun finishGame() {
-        timerJob?.cancel()
-        _uiState.value = _uiState.value.copy(
-            gameFinished = true,
-            showExitGameDialog = true   // 改为显示退出选择对话框
-        )
-    }
-
-    // 显示退出选择对话框
+    // 显示退出选择对话框（暂停游戏）
     fun showExitGameDialog() {
+        pauseGame()
         _uiState.value = _uiState.value.copy(showExitGameDialog = true)
     }
 
+    // 关闭退出对话框（恢复游戏，如果游戏未结束）
     fun dismissExitGameDialog() {
         _uiState.value = _uiState.value.copy(showExitGameDialog = false)
+        if (!_uiState.value.gameFinished) {
+            resumeGame()
+        }
     }
 
+    // 结束游戏（不显示对话框，仅停止计时器并标记结束）
+    private fun endGame() {
+        timerJob?.cancel()
+        _uiState.value = _uiState.value.copy(gameFinished = true)
+    }
+
+    // 游戏自然结束时调用（显示对话框）
+    private fun finishGame() {
+        endGame()
+        _uiState.value = _uiState.value.copy(showExitGameDialog = true)
+    }
+
+    // 右上角“退出”按钮调用
+    fun exitGame() {
+        showExitGameDialog()
+    }
+
+    // 用户选择不保存直接返回
     fun returnWithoutSaving() {
-        dismissExitGameDialog()
+        dismissExitGameDialog()   // 关闭对话框
+        endGame()                 // 结束游戏
         returnCallback?.invoke()
     }
 
-    // 保存分数（需要昵称）
+    // 保存分数（需要先检查昵称）
     fun saveScoreAndReturn() {
         viewModelScope.launch {
             val state = _uiState.value
             val nickname = NicknameRepository.getNickname(context)
             if (nickname.isNullOrBlank()) {
+                // 关闭退出对话框，显示昵称对话框
                 _uiState.value = state.copy(
                     showExitGameDialog = false,
                     showNicknameForSave = true
                 )
+                // 注意：此时游戏仍是暂停状态（因为退出对话框被关闭时没有调用 resumeGame）
+                // 在昵称对话框确认或取消时再决定恢复
             } else {
                 saveScoreWithNickname(nickname)
-                returnCallback?.invoke()
             }
         }
     }
 
+    // 保存分数（已知昵称）
     fun saveScoreWithNickname(nickname: String) {
         viewModelScope.launch {
             val state = _uiState.value
             NicknameRepository.saveNickname(context, nickname)
+            // 计算真实总用时（减去暂停时间）
+            val totalSeconds = ((System.currentTimeMillis() - startTime - pausedDuration) / 1000).toInt()
             val entry = LeaderboardEntry(
                 nickname = nickname,
                 score = state.score,
-                timeSeconds = state.totalTimeSeconds,
+                timeSeconds = totalSeconds,
                 mode = when (mode) {
                     is GameMode.Challenge -> "challenge"
                     is GameMode.Endless -> "endless"
@@ -251,6 +289,7 @@ class GameController(
                 showNicknameForSave = false,
                 gameFinished = true
             )
+            endGame()   // 确保停止计时器
             returnCallback?.invoke()
         }
     }
